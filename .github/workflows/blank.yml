@@ -90,23 +90,43 @@ jobs:
             fi
             mkdir -p clang && curl -sL "${{ inputs.clang_url }}" | tar xz -C clang
             CLANGDIR=$(find clang -maxdepth 2 -name bin -type d | head -1)
-            echo "CC=ccache $PWD/$CLANGDIR/clang"          >> $GITHUB_ENV
+            echo "MAKE_CC=ccache $PWD/$CLANGDIR/clang"     >> $GITHUB_ENV
             echo "CROSS_COMPILE=aarch64-linux-gnu-"        >> $GITHUB_ENV
             echo "CLANG_TRIPLE=aarch64-linux-gnu-"         >> $GITHUB_ENV
           else
-            echo "CC=ccache aarch64-linux-gnu-gcc"         >> $GITHUB_ENV
+            echo "MAKE_CC=ccache aarch64-linux-gnu-gcc"    >> $GITHUB_ENV
             echo "CROSS_COMPILE=aarch64-linux-gnu-"        >> $GITHUB_ENV
           fi
+
+      - name: 编译器自检（暴露真实错误）
+        run: |
+          echo "--- 交叉编译器 ---"
+          command -v aarch64-linux-gnu-gcc || echo "!! 未找到交叉编译器"
+          aarch64-linux-gnu-gcc --version 2>&1 | head -1
+          command -v ccache || echo "!! ccache 未安装"
+          echo "--- 复现 prepare-compiler-check 的实际命令 ---"
+          set +e
+          aarch64-linux-gnu-gcc -fstack-protector-strong -S -o /dev/null -x c /dev/null
+          echo "裸 gcc            rc=$?"
+          ccache aarch64-linux-gnu-gcc -fstack-protector-strong -S -o /dev/null -x c /dev/null
+          echo "ccache + gcc      rc=$?"
+          set -e
 
       - name: 配置 defconfig
         working-directory: ksrc
         run: |
-          make O=out ARCH=arm64 ${{ inputs.defconfig }}
+          make O=out ARCH=arm64 CC="$MAKE_CC" CROSS_COMPILE="$CROSS_COMPILE" ${{ inputs.defconfig }}
           # 关掉调试信息：省磁盘、省时间，不影响符号解析
           scripts/config --file out/.config --disable CONFIG_DEBUG_INFO
-          make O=out ARCH=arm64 olddefconfig
+          # 关键：4.14 的 prepare-compiler-check 会把任何编译失败都报成
+          # "Cannot use CONFIG_CC_STACKPROTECTOR_STRONG: ... not supported"（stderr 被丢弃）。
+          # 关掉 stack protector 后 stackp-name 为空，该检查直接 exit 0 短路。
+          # 对外部模块无影响：vermagic 与符号 CRC 都不含 stack protector 信息。
+          scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_STRONG
+          scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR
+          make O=out ARCH=arm64 CC="$MAKE_CC" CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
           echo "--- 关键配置 ---"
-          grep -E 'CONFIG_MODVERSIONS|CONFIG_MODULES|CONFIG_MODULE_SIG=' out/.config || true
+          grep -E 'CONFIG_MODVERSIONS|CONFIG_MODULES|CONFIG_MODULE_SIG=|CONFIG_CC_STACKPROTECTOR' out/.config || true
           if grep -q '^CONFIG_MODVERSIONS=y' out/.config; then
             echo "::warning::CONFIG_MODVERSIONS=y，prepare 策略可能缺少完整符号表，必要时改用 vmlinux/full"
           fi
@@ -136,7 +156,7 @@ jobs:
         if: ${{ inputs.build_strategy == 'prepare' }}
         working-directory: ksrc
         run: |
-          make O=out ARCH=arm64 modules_prepare
+          make O=out ARCH=arm64 CC="$MAKE_CC" CROSS_COMPILE="$CROSS_COMPILE" modules_prepare
           ls -l out/Module.symvers out/scripts 2>/dev/null || true
           df -h /
 
@@ -144,7 +164,7 @@ jobs:
         if: ${{ inputs.build_strategy == 'vmlinux' }}
         working-directory: ksrc
         run: |
-          make O=out ARCH=arm64 -j$(nproc) vmlinux
+          make O=out ARCH=arm64 CC="$MAKE_CC" CROSS_COMPILE="$CROSS_COMPILE" -j$(nproc) vmlinux
           ls -lh out/vmlinux
           df -h /
 
@@ -152,7 +172,7 @@ jobs:
         if: ${{ inputs.build_strategy == 'full' }}
         working-directory: ksrc
         run: |
-          make O=out ARCH=arm64 -j$(nproc)
+          make O=out ARCH=arm64 CC="$MAKE_CC" CROSS_COMPILE="$CROSS_COMPILE" -j$(nproc)
           df -h /
 
       - name: 放入驱动源码
@@ -166,7 +186,7 @@ jobs:
         working-directory: ksrc
         run: |
           set +e
-          make O=out ARCH=arm64 M="$GITHUB_WORKSPACE/ksrc/$MOD_DIR" modules
+          make O=out ARCH=arm64 CC="$MAKE_CC" CROSS_COMPILE="$CROSS_COMPILE" M="$GITHUB_WORKSPACE/ksrc/$MOD_DIR" modules
           rc=$?
           set -e
           if [ $rc -ne 0 ]; then
