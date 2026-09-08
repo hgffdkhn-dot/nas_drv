@@ -26,11 +26,15 @@ on:
         description: 'clang 压缩包 URL（toolchain=clang 时必填）'
         required: false
         default: ''
-      full_build:
-        description: 'true = 编完整内核（慢，兜底用）'
-        required: false
-        default: 'false'
-        type: boolean
+      build_strategy:
+        description: '内核准备策略（首选 prepare）'
+        required: true
+        default: 'prepare'
+        type: choice
+        options:
+          - prepare
+          - vmlinux
+          - full
 
 jobs:
   build:
@@ -41,21 +45,18 @@ jobs:
       ARCH: arm64
       KERNEL_REPO: https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
       MOD_DIR: drivers/misc/nas_drv
+      # MTK 源码里有大量 printf 格式串与参数不匹配的遗留代码
+      # （drivers/gpu/drm/... 用 %d 打印 __func__、%lx 打印 resource_size_t 等）。
+      # 原厂旧编译器只报 warning，GCC 11 + 内核 -Werror 会直接编不过。
+      # KCFLAGS 在顶层 Makefile 中以 KBUILD_CFLAGS += $(KCFLAGS) 追加到最后，
+      # 因此能覆盖掉前面的 -Werror。
+      KCFLAGS: -Wno-error
 
     steps:
       - name: 检出本仓库（内含 nas_drv/）
         uses: actions/checkout@v4
         with:
           path: src
-
-      - name: 清理磁盘
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
-                     /opt/ghc /usr/lib/jvm /opt/hostedtoolcache/CodeQL \
-                     "$AGENT_TOOLSDIRECTORY" || true
-          sudo apt-get clean
-          df -h /
 
       - name: 安装依赖
         run: |
@@ -104,19 +105,55 @@ jobs:
           # 关掉调试信息：省磁盘、省时间，不影响符号解析
           scripts/config --file out/.config --disable CONFIG_DEBUG_INFO
           make O=out ARCH=arm64 olddefconfig
-          grep -E 'CONFIG_MODVERSIONS|CONFIG_MODULES' out/.config || true
+          echo "--- 关键配置 ---"
+          grep -E 'CONFIG_MODVERSIONS|CONFIG_MODULES|CONFIG_MODULE_SIG=' out/.config || true
+          if grep -q '^CONFIG_MODVERSIONS=y' out/.config; then
+            echo "::warning::CONFIG_MODVERSIONS=y，prepare 策略可能缺少完整符号表，必要时改用 vmlinux/full"
+          fi
 
-      - name: 编译 vmlinux（只编内核本体，跳过全部模块）
+      - name: 移除内核树里的 -Werror
+        working-directory: ksrc
+        run: |
+          # 小米/联发科源码自带大量格式串 bug（pr_info 用 %d 打 __func__、
+          # %lx 打 resource_size_t 等），在 GCC 11 下被 -Werror 放大成错误，
+          # 例如 drivers/gpu/drm/panel/aw2028_led.c、mediatek/mtk_drm_drv.c。
+          # 子目录 Makefile 里的 ccflags-y += -Werror 会追加在 KCFLAGS 之后，
+          # 单靠 KCFLAGS=-Wno-error 盖不住，故从源头清掉。
+          # 先删带参数的（-Werror=xxx），再删裸的，避免残留 "=xxx"。
+          FILES=$(grep -rl --include=Makefile --include=Kbuild --include=*.mk \
+                       -e '-Werror' . || true)
+          if [ -n "$FILES" ]; then
+            echo "命中文件："
+            echo "$FILES"
+            echo "$FILES" | xargs -r perl -pi -e 's/-Werror(=[A-Za-z0-9_-]+)?//g'
+          else
+            echo "未在 Makefile/Kbuild 中发现 -Werror"
+          fi
+          echo "--- 复查 ---"
+          grep -rn --include=Makefile --include=Kbuild -e '-Werror' . || echo "已清空"
+
+      - name: 准备内核构建环境（prepare，不编任何 .o）
+        if: ${{ inputs.build_strategy == 'prepare' }}
+        working-directory: ksrc
+        run: |
+          make O=out ARCH=arm64 modules_prepare
+          ls -l out/Module.symvers out/scripts 2>/dev/null || true
+          df -h /
+
+      - name: 编译 vmlinux（含 built-in 驱动，较慢）
+        if: ${{ inputs.build_strategy == 'vmlinux' }}
         working-directory: ksrc
         run: |
           make O=out ARCH=arm64 -j$(nproc) vmlinux
           ls -lh out/vmlinux
           df -h /
 
-      - name: 兜底：编完整内核
-        if: ${{ inputs.full_build == 'true' }}
+      - name: 编译完整内核（最慢，兜底）
+        if: ${{ inputs.build_strategy == 'full' }}
         working-directory: ksrc
-        run: make O=out ARCH=arm64 -j$(nproc)
+        run: |
+          make O=out ARCH=arm64 -j$(nproc)
+          df -h /
 
       - name: 放入驱动源码
         run: |
@@ -125,9 +162,20 @@ jobs:
           ls -l "ksrc/$MOD_DIR"
 
       - name: 编译 NAS 模块
+        id: mod
         working-directory: ksrc
         run: |
+          set +e
           make O=out ARCH=arm64 M="$GITHUB_WORKSPACE/ksrc/$MOD_DIR" modules
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "::error::模块编译失败（rc=$rc）"
+            if [ "${{ inputs.build_strategy }}" = "prepare" ]; then
+              echo "::error::prepare 策略若报符号/CRC 解析失败，请把 build_strategy 改成 vmlinux 重跑"
+            fi
+            exit $rc
+          fi
           find "$GITHUB_WORKSPACE/ksrc/$MOD_DIR" -name '*.ko' -ls
 
       - name: 校验 vermagic
@@ -144,4 +192,3 @@ jobs:
           name: nas_drv-ko-${{ inputs.kernel_branch }}
           path: ksrc/drivers/misc/nas_drv/nas_drv.ko
           if-no-files-found: error
-
