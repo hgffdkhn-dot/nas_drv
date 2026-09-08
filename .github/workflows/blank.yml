@@ -131,26 +131,35 @@ jobs:
             echo "::warning::CONFIG_MODVERSIONS=y，prepare 策略可能缺少完整符号表，必要时改用 vmlinux/full"
           fi
 
-      - name: 移除内核树里的 -Werror
+      - name: 移除内核树里的 -Werror（仅 vmlinux/full 需要）
+        if: ${{ inputs.build_strategy != 'prepare' }}
         working-directory: ksrc
         run: |
-          # 小米/联发科源码自带大量格式串 bug（pr_info 用 %d 打 __func__、
-          # %lx 打 resource_size_t 等），在 GCC 11 下被 -Werror 放大成错误，
-          # 例如 drivers/gpu/drm/panel/aw2028_led.c、mediatek/mtk_drm_drv.c。
-          # 子目录 Makefile 里的 ccflags-y += -Werror 会追加在 KCFLAGS 之后，
-          # 单靠 KCFLAGS=-Wno-error 盖不住，故从源头清掉。
-          # 先删带参数的（-Werror=xxx），再删裸的，避免残留 "=xxx"。
+          # 只在会真正编译 drivers/ 时才跑这一步。
+          # prepare 策略根本不编 drivers，跑了反而有风险：
+          # 早期版本用 s/-Werror(=[A-Za-z0-9_-]+)?//g 去删，
+          # 会把老式写法 -Werror-implicit-function-declaration 砍成
+          # -implicit-function-declaration，导致 kernel/bounds.s 直接编译失败。
+          #
+          # 正确做法是"改写"而不是"删除"，三种形态分别处理：
+          #   -Werror=xxx   -> -Wno-error=xxx
+          #   -Werror-xxx   -> -Wno-error=xxx   （老式写法，连字符不是等号）
+          #   -Werror       -> -Wno-error
           FILES=$(grep -rl --include=Makefile --include=Kbuild --include=*.mk \
                        -e '-Werror' . || true)
           if [ -n "$FILES" ]; then
             echo "命中文件："
             echo "$FILES"
-            echo "$FILES" | xargs -r perl -pi -e 's/-Werror(=[A-Za-z0-9_-]+)?//g'
+            echo "$FILES" | xargs -r perl -pi -e \
+              's/-Werror=/-Wno-error=/g;
+               s/-Werror-(?=[A-Za-z0-9])/-Wno-error=/g;
+               s/(?<![\w-])-Werror(?![=\w-])/-Wno-error/g;'
           else
             echo "未在 Makefile/Kbuild 中发现 -Werror"
           fi
-          echo "--- 复查 ---"
-          grep -rn --include=Makefile --include=Kbuild -e '-Werror' . || echo "已清空"
+          echo "--- 复查：不应再有孤立的 -Werror 或残缺的 -xxx-declaration ---"
+          grep -rn --include=Makefile --include=Kbuild --include=*.mk \
+               -e '-Werror' . || echo "已无裸 -Werror"
 
       - name: 准备内核构建环境（prepare，不编任何 .o）
         if: ${{ inputs.build_strategy == 'prepare' }}
