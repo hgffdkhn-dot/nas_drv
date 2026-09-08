@@ -1,0 +1,147 @@
+name: Build NAS kernel module
+
+# 目标：Redmi K40 Gaming (ares) / MT6893 / Linux 4.14.186
+# 手工触发，避免 push 就烧 CI 时长
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '内核分支'
+        required: true
+        default: 'ares-r-oss'
+      defconfig:
+        description: 'defconfig 名称'
+        required: true
+        default: 'ares_user_defconfig'
+      toolchain:
+        description: '工具链（若 gcc 报错再试 clang）'
+        required: true
+        default: 'gcc'
+        type: choice
+        options:
+          - gcc
+          - clang
+      clang_url:
+        description: 'clang 压缩包 URL（toolchain=clang 时必填）'
+        required: false
+        default: ''
+      full_build:
+        description: 'true = 编完整内核（慢，兜底用）'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350        # Actions 上限 360
+
+    env:
+      ARCH: arm64
+      KERNEL_REPO: https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
+      MOD_DIR: drivers/misc/nas_drv
+
+    steps:
+      - name: 检出本仓库（内含 nas_drv/）
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: 清理磁盘
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                     /opt/ghc /usr/lib/jvm /opt/hostedtoolcache/CodeQL \
+                     "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            ccache cpio kmod xz-utils rsync \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ inputs.kernel_branch }}-${{ inputs.defconfig }}-${{ inputs.toolchain }}
+          restore-keys: ccache-
+
+      - name: 拉取内核源码
+        run: |
+          git clone --depth 1 -b "${{ inputs.kernel_branch }}" \
+            "$KERNEL_REPO" ksrc
+          du -sh ksrc
+          df -h /
+
+      - name: 准备工具链变量
+        id: tc
+        run: |
+          if [ "${{ inputs.toolchain }}" = "clang" ]; then
+            if [ -z "${{ inputs.clang_url }}" ]; then
+              echo "::error::toolchain=clang 时必须填 clang_url"
+              exit 1
+            fi
+            mkdir -p clang && curl -sL "${{ inputs.clang_url }}" | tar xz -C clang
+            CLANGDIR=$(find clang -maxdepth 2 -name bin -type d | head -1)
+            echo "CC=ccache $PWD/$CLANGDIR/clang"          >> $GITHUB_ENV
+            echo "CROSS_COMPILE=aarch64-linux-gnu-"        >> $GITHUB_ENV
+            echo "CLANG_TRIPLE=aarch64-linux-gnu-"         >> $GITHUB_ENV
+          else
+            echo "CC=ccache aarch64-linux-gnu-gcc"         >> $GITHUB_ENV
+            echo "CROSS_COMPILE=aarch64-linux-gnu-"        >> $GITHUB_ENV
+          fi
+
+      - name: 配置 defconfig
+        working-directory: ksrc
+        run: |
+          make O=out ARCH=arm64 ${{ inputs.defconfig }}
+          # 关掉调试信息：省磁盘、省时间，不影响符号解析
+          scripts/config --file out/.config --disable CONFIG_DEBUG_INFO
+          make O=out ARCH=arm64 olddefconfig
+          grep -E 'CONFIG_MODVERSIONS|CONFIG_MODULES' out/.config || true
+
+      - name: 编译 vmlinux（只编内核本体，跳过全部模块）
+        working-directory: ksrc
+        run: |
+          make O=out ARCH=arm64 -j$(nproc) vmlinux
+          ls -lh out/vmlinux
+          df -h /
+
+      - name: 兜底：编完整内核
+        if: ${{ inputs.full_build == 'true' }}
+        working-directory: ksrc
+        run: make O=out ARCH=arm64 -j$(nproc)
+
+      - name: 放入驱动源码
+        run: |
+          mkdir -p "ksrc/$MOD_DIR"
+          cp src/nas_drv/nas_drv.c src/nas_drv/nas_drv.h src/nas_drv/Kbuild "ksrc/$MOD_DIR/"
+          ls -l "ksrc/$MOD_DIR"
+
+      - name: 编译 NAS 模块
+        working-directory: ksrc
+        run: |
+          make O=out ARCH=arm64 M="$GITHUB_WORKSPACE/ksrc/$MOD_DIR" modules
+          find "$GITHUB_WORKSPACE/ksrc/$MOD_DIR" -name '*.ko' -ls
+
+      - name: 校验 vermagic
+        run: |
+          KO=$(find "ksrc/$MOD_DIR" -name 'nas_drv.ko' | head -1)
+          echo "KO=$KO"
+          echo "--- vermagic / 依赖 ---"
+          strings "$KO" | grep -E 'vermagic|depends|name=' || true
+          echo "$KO" >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: nas_drv-ko-${{ inputs.kernel_branch }}
+          path: ksrc/drivers/misc/nas_drv/nas_drv.ko
+          if-no-files-found: error
+
