@@ -1,0 +1,12 @@
+# 供内核构建系统使用：make -C <kernel> M=<本目录> modules
+#
+# 说明：当目录内同时存在 Kbuild 和 Makefile 时，内核构建系统
+#       优先使用 Kbuild。因此这里的 Kbuild 只声明模块目标，
+#       而独立的 Makefile 保留给"脱离内核源码树"的本地编译用。
+
+obj-m += nas_drv.o
+
+# 如需把驱动直接编进内核镜像（obj-y），改为：
+# obj-y += nas_drv.o
+
+ccflags-y += -Wall -Wextra -Wno-unused-parameter
